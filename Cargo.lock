@@ -178,6 +178,7 @@ dependencies = [
 name = "link-spike"
 version = "0.1.1"
 dependencies = [
+ "core-foundation-sys",
  "coremidi",
  "mach2",
  "rosc",

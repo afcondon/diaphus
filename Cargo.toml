@@ -8,6 +8,7 @@ rusty_link = "0.4"
 rosc = "0.10"
 coremidi = "0.8"
 mach2 = "0.4"
+core-foundation-sys = "0.8"
 
 [profile.release]
 opt-level = 3

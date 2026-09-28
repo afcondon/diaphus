@@ -47,6 +47,7 @@
 //   duty          fraction of beat the CV gate is on, default 0.5
 
 use coremidi::{Client, Destination, Destinations, OutputPort, PacketBuffer};
+use core_foundation_sys::runloop::{kCFRunLoopDefaultMode, kCFRunLoopRunHandledSource, CFRunLoopRunInMode};
 use mach2::mach_time::{mach_absolute_time, mach_timebase_info, mach_timebase_info_data_t};
 use rosc::{OscMessage, OscPacket, OscType, decoder, encoder};
 use rusty_link::{AblLink, SessionState};
@@ -85,6 +86,8 @@ const ANCHOR_TARGETS: &[&str] =
     &["127.0.0.1:57121", "127.0.0.1:57123", "127.0.0.1:57125", "127.0.0.1:57127"];
 const MIDI_RX_ADDR: &str = "127.0.0.1:57122";
 const ANCHOR_PERIOD: Duration = Duration::from_millis(100);
+/// How often the main loop asks CoreMIDI whether devices came or went.
+const MIDI_REFRESH_PERIOD: Duration = Duration::from_millis(500);
 const GATE_VALUE: f32 = 0.5;
 
 /// Schedule beats this far ahead in the Link timeline. Should exceed
@@ -141,6 +144,15 @@ fn unix_micros_to_mach(unix_micros_at: i64, tb: &mach_timebase_info_data_t) -> u
 /// Owns the CoreMIDI output port plus a destination-name cache. Lookup is
 /// O(1) after the first send to a given port name; first send pays one
 /// linear scan of `Destinations` and inserts the result.
+///
+/// **Devices come and go.** CoreMIDI tells a client about a device plugged in
+/// (or out) through notifications on the run loop of the thread that made the
+/// client, and this is a polling loop that never ran one: so the device list
+/// stayed as it was at start, and a module powered on later was an "unknown
+/// destination" for good (found 2026-09-28: the FH-2, 373 rejected notes, until
+/// a restart). `refresh` pumps that run loop and, when the number of
+/// forgets every cached lookup, so a replugged device is looked up again
+/// rather than served from a dead handle.
 struct MidiDispatch {
     port: OutputPort,
     cache: HashMap<String, Destination>,
@@ -155,10 +167,40 @@ impl MidiDispatch {
         Self { port, cache: HashMap::new(), tb }
     }
 
+    /// Deliver any pending CoreMIDI notifications (returns at once if there are
+    /// none), then forget every cached destination. Must
+    /// run on the thread that created the client: `main`'s.
+    fn refresh(&mut self) {
+        // One call handles one pending source, and a device change arrives as
+        // several notifications, so drain them (capped, so a storm cannot stall
+        // the clock loop).
+        for _ in 0..64 {
+            let handled = unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1) };
+            if handled != kCFRunLoopRunHandledSource {
+                break;
+            }
+        }
+        // Forget every lookup, every time. Counting destinations is not enough:
+        // a device unplugged and replugged between two refreshes leaves the count
+        // unchanged and the cached handle dead, and a send to a dead handle does
+        // not fail. A name is looked up at most twice a second, a scan of a
+        // couple of dozen endpoints.
+        self.cache.clear();
+    }
+
+    /// A send that fails means the handle is dead: look the name up again next time.
+    fn sent(&mut self, name: &str, result: Result<(), i32>) {
+        if let Err(status) = result {
+            eprintln!("midi: send to '{}' failed ({}); forgetting it", name, status);
+            self.cache.remove(name);
+        }
+    }
+
     fn resolve(&mut self, name: &str) -> Option<Destination> {
         if let Some(d) = self.cache.get(name) {
             return Some(d.clone());
         }
+        self.refresh();
         let dest = Destinations
             .into_iter()
             .find(|d| d.display_name().as_deref() == Some(name))?;
@@ -185,8 +227,10 @@ impl MidiDispatch {
         let ch = channel_1idx.saturating_sub(1) & 0x0F;
         let on_pkt = PacketBuffer::new(on_ts, &[0x90 | ch, note & 0x7F, velocity & 0x7F]);
         let off_pkt = PacketBuffer::new(off_ts, &[0x80 | ch, note & 0x7F, 0]);
-        let _ = self.port.send(&dest, &on_pkt);
-        let _ = self.port.send(&dest, &off_pkt);
+        let on = self.port.send(&dest, &on_pkt);
+        self.sent(port_name, on);
+        let off = self.port.send(&dest, &off_pkt);
+        self.sent(port_name, off);
     }
 
     fn schedule_cc(
@@ -204,7 +248,8 @@ impl MidiDispatch {
         let ts = unix_micros_to_mach(unix_micros_at, &self.tb);
         let ch = channel_1idx.saturating_sub(1) & 0x0F;
         let pkt = PacketBuffer::new(ts, &[0xB0 | ch, cc & 0x7F, value & 0x7F]);
-        let _ = self.port.send(&dest, &pkt);
+        let result = self.port.send(&dest, &pkt);
+        self.sent(port_name, result);
     }
 }
 
@@ -494,6 +539,7 @@ fn main() {
     let mut last_scheduled_beat: i64 = i64::MIN;
     let mut last_peers: u64 = u64::MAX;
     let mut last_anchor_send = Instant::now() - ANCHOR_PERIOD;
+    let mut last_midi_refresh = Instant::now();
     let mut last_logged_tempo: f64 = -1.0;
     let lookahead_micros = (LOOKAHEAD_MS * 1000.0) as i64;
 
@@ -510,6 +556,11 @@ fn main() {
     let mut rx_buf = [0u8; 4096];
 
     loop {
+        // Hear about MIDI devices plugged in or out (see `MidiDispatch::refresh`).
+        if last_midi_refresh.elapsed() >= MIDI_REFRESH_PERIOD {
+            dispatch.refresh();
+            last_midi_refresh = Instant::now();
+        }
         link.capture_app_session_state(&mut state);
         let now_micros = link.clock_micros();
 
