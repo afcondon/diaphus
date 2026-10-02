@@ -2,9 +2,8 @@
 
 *Formerly link-spike (renamed 2026-10-02).* Named for Diaphus effulgens, a
 lanternfish, as the chart draws it: the light everything on the rig keeps time
-by. The binary is still `target/release/link-spike`, because macOS ties
-Link's multicast permission to the signed binary; renaming it is a separate,
-careful step.
+by. The binary is `target/release/diaphus`, ad-hoc signed as
+`com.afc.diaphus`; its CoreMIDI client is `diaphus`.
 
 Minimal Ableton Link client. Joins a Link session over Wi-Fi, fires OSC `/cv/trig` to a sibling [`cv-router`](../cv-router) on each integer beat at 50%-of-beat duty (configurable). Pulse width derived from live tempo, so it tracks tempo changes from any peer (Ableton Live, Intellijel ML-2, AUM, etc.).
 

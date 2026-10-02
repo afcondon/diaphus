@@ -5,7 +5,7 @@
   # `nix develop` drops you into the same byte-for-byte pin the whole fleet uses.
   # The Quartermaster input is git+ssh (portable across every fleet box), not a
   # machine-local path — so this flake provisions cross-machine (ADR 0007).
-  description = "link-spike — product flake (devShell via Quartermaster)";
+  description = "diaphus — product flake (devShell via Quartermaster)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";

@@ -1,4 +1,4 @@
-// link-spike: rig-wide Link bridge + MIDI dispatcher.
+// diaphus: rig-wide Link bridge + MIDI dispatcher.
 //
 // Responsibilities:
 //
@@ -40,7 +40,7 @@
 //   /midi/cc/at    ,siiih   port_name(s)  channel(i, 1-16)  cc(i, 0-127)
 //                          value(i, 0-127)  unix_micros_at(h)
 //
-// Usage: link-spike [--debug-beat] [--test-midi] [bus] [duty]
+// Usage: diaphus [--debug-beat] [--test-midi] [bus] [duty]
 //   --debug-beat  enable per-beat /cv/trig/at + stdout log (off by default)
 //   --test-midi   enable per-beat MIDI note 62 → "Patterning 3"
 //   bus           OSC bus for the --debug-beat CV gate, default 8 (= ES-9 panel jack 1)
@@ -67,7 +67,7 @@ const ES9_DAEMON_ADDR: &str = "127.0.0.1:57130";
 /// clock RPC; es9-daemon on 57123 for tempo-relative polyclock/polyeuclid
 /// generator rates; itajara on 57125 for the bar, which is the length a
 /// loop gets rounded to. Add more here when new consumers want the anchor
-/// stream — link-spike is fire-and-forget so an unbound listener costs
+/// stream — diaphus is fire-and-forget so an unbound listener costs
 /// only the send.
 ///
 /// itajara is the first consumer that will need `beat` and `quantum` and not
@@ -162,7 +162,7 @@ struct MidiDispatch {
 impl MidiDispatch {
     fn new(client: &Client, tb: mach_timebase_info_data_t) -> Self {
         let port = client
-            .output_port("link-spike-out")
+            .output_port("diaphus-out")
             .expect("create CoreMIDI output port");
         Self { port, cache: HashMap::new(), tb }
     }
@@ -443,7 +443,7 @@ fn main() {
     let duty: f32 = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.5);
 
     println!(
-        "link-spike: starting at {} BPM. MIDI dispatch on UDP {}{}{}",
+        "diaphus: starting at {} BPM. MIDI dispatch on UDP {}{}{}",
         INITIAL_TEMPO,
         MIDI_RX_ADDR,
         if debug_beat {
@@ -507,7 +507,7 @@ fn main() {
     }
     println!("mach timebase: numer={} denom={}", tb.numer, tb.denom);
 
-    let midi_client = Client::new("link-spike").expect("create CoreMIDI client");
+    let midi_client = Client::new("diaphus").expect("create CoreMIDI client");
     let mut dispatch = MidiDispatch::new(&midi_client, tb);
 
     // Pre-warm the test destination so any "destination not found" surfaces

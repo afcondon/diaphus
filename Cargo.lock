@@ -132,6 +132,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "diaphus"
+version = "0.1.1"
+dependencies = [
+ "core-foundation-sys",
+ "coremidi",
+ "mach2",
+ "rosc",
+ "rusty_link",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -172,17 +183,6 @@ checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
  "cfg-if",
  "windows-link",
-]
-
-[[package]]
-name = "link-spike"
-version = "0.1.1"
-dependencies = [
- "core-foundation-sys",
- "coremidi",
- "mach2",
- "rosc",
- "rusty_link",
 ]
 
 [[package]]
