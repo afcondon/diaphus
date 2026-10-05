@@ -40,6 +40,17 @@
 //   /midi/cc/at    ,siiih   port_name(s)  channel(i, 1-16)  cc(i, 0-127)
 //                          value(i, 0-127)  unix_micros_at(h)
 //
+// 6. MIDI Clock, locked to Link. 24 ticks a beat, read off the Link
+//    timeline and kernel-timestamped like every other note, to each port
+//    named in DIAPHUS_CLOCK_PORTS (comma-separated; default "FH-2"; empty
+//    for none). A Start goes out on a bar line, before that bar's first
+//    tick, when the clock begins and whenever a port comes back after
+//    going away, so a device's own patterns restart on the rig's downbeat.
+//    Found 2026-10-05: the FH-2's Euclideans and clocks step on its own
+//    master clock, nothing in the rig sent one, and the FHX-8GT sat dark
+//    with every setting right. Its LFOs moved meanwhile, being free-running,
+//    which is what made a clock look present.
+//
 // Usage: diaphus [--debug-beat] [--test-midi] [bus] [duty]
 //   --debug-beat  enable per-beat /cv/trig/at + stdout log (off by default)
 //   --test-midi   enable per-beat MIDI note 62 → "Patterning 3"
@@ -89,6 +100,11 @@ const ANCHOR_PERIOD: Duration = Duration::from_millis(100);
 /// How often the main loop asks CoreMIDI whether devices came or went.
 const MIDI_REFRESH_PERIOD: Duration = Duration::from_millis(500);
 const GATE_VALUE: f32 = 0.5;
+
+/// MIDI Clock's resolution: ticks per quarter note, fixed by the MIDI spec.
+const CLOCK_PPQN: f64 = 24.0;
+/// The ports clocked when DIAPHUS_CLOCK_PORTS is not set.
+const DEFAULT_CLOCK_PORTS: &str = "FH-2";
 
 /// Schedule beats this far ahead in the Link timeline. Should exceed
 /// es9-daemon's audio buffer (~8 ms) plus OSC RTT (sub-ms over loopback).
@@ -233,6 +249,22 @@ impl MidiDispatch {
         self.sent(port_name, off);
     }
 
+    /// Schedule raw bytes (clock, start) at a Unix time. Unlike the note and
+    /// cc paths this does not look a missing port up again: it is called 24
+    /// times a beat, and a lookup that misses pumps the run loop. The caller
+    /// keeps a port it could not find aside until the next refresh.
+    fn schedule_raw(&mut self, port_name: &str, bytes: &[u8], unix_micros_at: i64) -> bool {
+        let Some(dest) = self.cache.get(port_name).cloned() else {
+            return false;
+        };
+        let ts = unix_micros_to_mach(unix_micros_at, &self.tb);
+        let pkt = PacketBuffer::new(ts, bytes);
+        let result = self.port.send(&dest, &pkt);
+        let ok = result.is_ok();
+        self.sent(port_name, result);
+        ok
+    }
+
     fn schedule_cc(
         &mut self,
         port_name: &str,
@@ -250,6 +282,39 @@ impl MidiDispatch {
         let pkt = PacketBuffer::new(ts, &[0xB0 | ch, cc & 0x7F, value & 0x7F]);
         let result = self.port.send(&dest, &pkt);
         self.sent(port_name, result);
+    }
+}
+
+/// One port that Diaphus clocks. `present` is whether it was found at the last
+/// refresh; `started` is whether it has had its Start since it was found.
+struct ClockOut {
+    port: String,
+    present: bool,
+    started: bool,
+}
+
+impl ClockOut {
+    fn from_env() -> Vec<ClockOut> {
+        let spec = std::env::var("DIAPHUS_CLOCK_PORTS").unwrap_or_else(|_| DEFAULT_CLOCK_PORTS.into());
+        spec.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| ClockOut { port: p.to_string(), present: false, started: false })
+            .collect()
+    }
+
+    /// Look the port up (at refresh time only), and say so when it comes or goes.
+    fn check(&mut self, dispatch: &mut MidiDispatch) {
+        let found = dispatch.resolve(&self.port).is_some();
+        if found != self.present {
+            if found {
+                println!("[clock] '{}' found; Start on the next bar line", self.port);
+            } else {
+                eprintln!("[clock] '{}' not found; clock held until it is", self.port);
+            }
+            self.present = found;
+            self.started = false;
+        }
     }
 }
 
@@ -535,8 +600,17 @@ fn main() {
     link.enable(true);
     link.enable_start_stop_sync(true);
 
+    let mut clocks = ClockOut::from_env();
+    for c in clocks.iter_mut() {
+        c.check(&mut dispatch);
+    }
+    if clocks.is_empty() {
+        println!("MIDI Clock: off (DIAPHUS_CLOCK_PORTS is empty)");
+    }
+
     let mut state = SessionState::new();
     let mut last_scheduled_beat: i64 = i64::MIN;
+    let mut last_scheduled_tick: i64 = i64::MIN;
     let mut last_peers: u64 = u64::MAX;
     let mut last_anchor_send = Instant::now() - ANCHOR_PERIOD;
     let mut last_midi_refresh = Instant::now();
@@ -559,6 +633,9 @@ fn main() {
         // Hear about MIDI devices plugged in or out (see `MidiDispatch::refresh`).
         if last_midi_refresh.elapsed() >= MIDI_REFRESH_PERIOD {
             dispatch.refresh();
+            for c in clocks.iter_mut() {
+                c.check(&mut dispatch);
+            }
             last_midi_refresh = Instant::now();
         }
         link.capture_app_session_state(&mut state);
@@ -637,6 +714,45 @@ fn main() {
                 }
             }
             last_scheduled_beat = next_beat;
+        }
+
+        // ─── 2b. MIDI Clock for upcoming ticks ─────────────────────────
+        // Tick n is beat n/24 on the Link timeline, so tempo changes and
+        // other peers' nudges are followed with no state of our own.
+        if !clocks.is_empty() {
+            let tick_at_lookahead =
+                (state.beat_at_time(now_micros + lookahead_micros, QUANTUM) * CLOCK_PPQN).floor() as i64;
+            if last_scheduled_tick == i64::MIN {
+                last_scheduled_tick =
+                    (state.beat_at_time(now_micros, QUANTUM) * CLOCK_PPQN).floor() as i64;
+            }
+            let unix_now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as i64;
+            let ticks_per_bar = (CLOCK_PPQN * QUANTUM) as i64;
+            while last_scheduled_tick < tick_at_lookahead {
+                let tick = last_scheduled_tick + 1;
+                let at = state.time_at_beat(tick as f64 / CLOCK_PPQN, QUANTUM);
+                if at >= now_micros {
+                    let unix_at = unix_now + (at - now_micros);
+                    for c in clocks.iter_mut().filter(|c| c.present) {
+                        // Start, then the bar's first tick at the same instant:
+                        // the clock after a Start is the first beat.
+                        if !c.started && tick.rem_euclid(ticks_per_bar) == 0 {
+                            if dispatch.schedule_raw(&c.port, &[0xFA], unix_at) {
+                                c.started = true;
+                                println!("[clock] Start to '{}' on beat {}", c.port, tick / CLOCK_PPQN as i64);
+                            }
+                        }
+                        if !dispatch.schedule_raw(&c.port, &[0xF8], unix_at) {
+                            c.present = false;
+                            c.started = false;
+                        }
+                    }
+                }
+                last_scheduled_tick = tick;
+            }
         }
 
         // ─── 3. Anchor publication (~10 Hz) ───────────────────────────
