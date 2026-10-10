@@ -249,6 +249,21 @@ impl MidiDispatch {
         self.sent(port_name, off);
     }
 
+    /// One channel message at a Unix time, its port looked up as the note and
+    /// cc paths do: a note-on or a note-off on its own, for a note held
+    /// until the next one arrives (legato), whose end is not known when it
+    /// starts.
+    fn schedule_message(&mut self, verb: &str, port_name: &str, bytes: &[u8], unix_micros_at: i64) {
+        let Some(dest) = self.resolve(port_name) else {
+            eprintln!("{}: unknown destination '{}'", verb, port_name);
+            return;
+        };
+        let ts = unix_micros_to_mach(unix_micros_at, &self.tb);
+        let pkt = PacketBuffer::new(ts, bytes);
+        let result = self.port.send(&dest, &pkt);
+        self.sent(port_name, result);
+    }
+
     /// Schedule raw bytes (clock, start) at a Unix time. Unlike the note and
     /// cc paths this does not look a missing port up again: it is called 24
     /// times a beat, and a lookup that misses pumps the run loop. The caller
@@ -375,6 +390,33 @@ fn handle_osc_message(msg: &OscMessage, dispatch: &mut MidiDispatch, link: &AblL
                 t => { eprintln!("/midi/note/at[5] Long expected, got {}", osc_type_name(t)); return; }
             };
             dispatch.schedule_note(port, channel, note, velocity, duration_ms, unix_us);
+        }
+        // /midi/on/at  port channel note velocity unix_us — a note-on alone
+        // /midi/off/at port channel note unix_us          — its note-off
+        "/midi/on/at" | "/midi/off/at" => {
+            let on = msg.addr == "/midi/on/at";
+            let want = if on { 5 } else { 4 };
+            if msg.args.len() != want {
+                eprintln!("{}: expected {} args, got {}", msg.addr, want, msg.args.len());
+                return;
+            }
+            let port = match &msg.args[0] {
+                OscType::String(s) => s,
+                t => { eprintln!("{}[0] String expected, got {}", msg.addr, osc_type_name(t)); return; }
+            };
+            let int = |i: usize| match &msg.args[i] {
+                OscType::Int(v) => Some(*v as u8),
+                t => { eprintln!("{}[{}] Int expected, got {}", msg.addr, i, osc_type_name(t)); None }
+            };
+            let (Some(channel), Some(note)) = (int(1), int(2)) else { return };
+            let velocity = if on { match int(3) { Some(v) => v, None => return } } else { 0 };
+            let unix_us = match &msg.args[want - 1] {
+                OscType::Long(l) => *l,
+                t => { eprintln!("{}[{}] Long expected, got {}", msg.addr, want - 1, osc_type_name(t)); return; }
+            };
+            let ch = channel.saturating_sub(1) & 0x0F;
+            let bytes = if on { [0x90 | ch, note & 0x7F, velocity & 0x7F] } else { [0x80 | ch, note & 0x7F, 0] };
+            dispatch.schedule_message(&msg.addr, port, &bytes, unix_us);
         }
         "/midi/cc/at" => {
             if msg.args.len() != 5 {
