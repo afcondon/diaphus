@@ -172,6 +172,9 @@ fn unix_micros_to_mach(unix_micros_at: i64, tb: &mach_timebase_info_data_t) -> u
 struct MidiDispatch {
     port: OutputPort,
     cache: HashMap<String, Destination>,
+    // names already reported as unknown or stood in for, so the log says it
+    // once rather than for every note
+    told: std::collections::HashSet<String>,
     tb: mach_timebase_info_data_t,
 }
 
@@ -180,7 +183,7 @@ impl MidiDispatch {
         let port = client
             .output_port("diaphus-out")
             .expect("create CoreMIDI output port");
-        Self { port, cache: HashMap::new(), tb }
+        Self { port, cache: HashMap::new(), told: std::collections::HashSet::new(), tb }
     }
 
     /// Deliver any pending CoreMIDI notifications (returns at once if there are
@@ -219,9 +222,42 @@ impl MidiDispatch {
         self.refresh();
         let dest = Destinations
             .into_iter()
-            .find(|d| d.display_name().as_deref() == Some(name))?;
+            .find(|d| d.display_name().as_deref() == Some(name))
+            .or_else(|| self.only_iac_for(name))?;
         self.cache.insert(name.to_string(), dest.clone());
         Some(dest)
+    }
+
+    /// An IAC bus asked for by a name CoreMIDI no longer has, when there is
+    /// exactly one IAC bus: that one. A browser running since before the bus
+    /// was renamed keeps its old name and hands it on, and every note was
+    /// dropped (installing-triggerfish#10). With two or more buses there is
+    /// no telling which was meant, so nothing.
+    fn only_iac_for(&mut self, name: &str) -> Option<Destination> {
+        if !name.starts_with("IAC Driver") {
+            return None;
+        }
+        let mut iac = Destinations
+            .into_iter()
+            .filter(|d| d.display_name().map_or(false, |n| n.starts_with("IAC Driver")));
+        let (Some(only), None) = (iac.next(), iac.next()) else {
+            return None;
+        };
+        if self.told.insert(name.to_string()) {
+            eprintln!(
+                "midi: no destination '{}'; sending to '{}', the only IAC bus",
+                name,
+                only.display_name().unwrap_or_default()
+            );
+        }
+        Some(only)
+    }
+
+    /// A destination that could not be placed, said once per name.
+    fn unknown(&mut self, verb: &str, name: &str) {
+        if self.told.insert(name.to_string()) {
+            eprintln!("{}: unknown destination '{}' (said once; every message to it is dropped)", verb, name);
+        }
     }
 
     fn schedule_note(
@@ -234,7 +270,7 @@ impl MidiDispatch {
         unix_micros_at: i64,
     ) {
         let Some(dest) = self.resolve(port_name) else {
-            eprintln!("midi/note/at: unknown destination '{}'", port_name);
+            self.unknown("midi/note/at", port_name);
             return;
         };
         let on_ts = unix_micros_to_mach(unix_micros_at, &self.tb);
@@ -255,7 +291,7 @@ impl MidiDispatch {
     /// starts.
     fn schedule_message(&mut self, verb: &str, port_name: &str, bytes: &[u8], unix_micros_at: i64) {
         let Some(dest) = self.resolve(port_name) else {
-            eprintln!("{}: unknown destination '{}'", verb, port_name);
+            self.unknown(verb, port_name);
             return;
         };
         let ts = unix_micros_to_mach(unix_micros_at, &self.tb);
@@ -289,7 +325,7 @@ impl MidiDispatch {
         unix_micros_at: i64,
     ) {
         let Some(dest) = self.resolve(port_name) else {
-            eprintln!("midi/cc/at: unknown destination '{}'", port_name);
+            self.unknown("midi/cc/at", port_name);
             return;
         };
         let ts = unix_micros_to_mach(unix_micros_at, &self.tb);
