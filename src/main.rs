@@ -109,6 +109,9 @@ const DEFAULT_CLOCK_PORTS: &str = "FH-2";
 /// Schedule beats this far ahead in the Link timeline. Should exceed
 /// es9-daemon's audio buffer (~8 ms) plus OSC RTT (sub-ms over loopback).
 const LOOKAHEAD_MS: f64 = 100.0;
+/// How far ahead of the bar's first tick a MIDI Start is sent: well inside one
+/// tick (15.6 ms at 160 BPM), and enough that the device has the Start first.
+const START_LEAD_MICROS: i64 = 2_000;
 
 // Test-mode (--test-midi) beat-marker constants — Phase 1B legacy.
 const TEST_MIDI_PORT: &str = "Patterning 3";
@@ -824,10 +827,12 @@ fn main() {
                 if at >= now_micros {
                     let unix_at = unix_now + (at - now_micros);
                     for c in clocks.iter_mut().filter(|c| c.present) {
-                        // Start, then the bar's first tick at the same instant:
-                        // the clock after a Start is the first beat.
+                        // Start just before the bar's first tick: the clock
+                        // after a Start is the first beat. At the same instant
+                        // they raced, and the FH-2 counted the tick before the
+                        // Start about one time in four, running a tick late.
                         if !c.started && tick.rem_euclid(ticks_per_bar) == 0 {
-                            if dispatch.schedule_raw(&c.port, &[0xFA], unix_at) {
+                            if dispatch.schedule_raw(&c.port, &[0xFA], unix_at - START_LEAD_MICROS) {
                                 c.started = true;
                                 println!("[clock] Start to '{}' on beat {}", c.port, tick / CLOCK_PPQN as i64);
                             }
