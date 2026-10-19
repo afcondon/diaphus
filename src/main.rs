@@ -40,6 +40,9 @@
 //   /midi/cc/at    ,siiih   port_name(s)  channel(i, 1-16)  cc(i, 0-127)
 //                          value(i, 0-127)  unix_micros_at(h)
 //
+//   /clock/restart ,        Start every clocked port again on the next bar
+//                          line (the FH-2 daemon, after its clocks change)
+//
 // 6. MIDI Clock, locked to Link. 24 ticks a beat, read off the Link
 //    timeline and kernel-timestamped like every other note, to each port
 //    named in DIAPHUS_CLOCK_PORTS (comma-separated; default "FH-2"; empty
@@ -50,6 +53,12 @@
 //    master clock, nothing in the rig sent one, and the FHX-8GT sat dark
 //    with every setting right. Its LFOs moved meanwhile, being free-running,
 //    which is what made a clock look present.
+//
+// 7. The clock origin. A device counts its divisions from its last Start, so
+//    the beat of that Start is where a ÷3 or ÷8 falls. Diaphus sends it to
+//    es9-daemon as `/clock/origin ,d beat` (10 Hz, beside the anchor), and
+//    es9-daemon counts its clocks and Euclids from the same beat, so the two
+//    rigs' divisions coincide. Added 2026-10-19.
 //
 // Usage: diaphus [--debug-beat] [--test-midi] [bus] [duty]
 //   --debug-beat  enable per-beat /cv/trig/at + stdout log (off by default)
@@ -96,6 +105,8 @@ const ES9_DAEMON_ADDR: &str = "127.0.0.1:57130";
 const ANCHOR_TARGETS: &[&str] =
     &["127.0.0.1:57121", "127.0.0.1:57123", "127.0.0.1:57125", "127.0.0.1:57127"];
 const MIDI_RX_ADDR: &str = "127.0.0.1:57122";
+/// Where `/clock/origin` goes: es9-daemon's anchor port.
+const ORIGIN_TARGET: &str = "127.0.0.1:57123";
 const ANCHOR_PERIOD: Duration = Duration::from_millis(100);
 /// How often the main loop asks CoreMIDI whether devices came or went.
 const MIDI_REFRESH_PERIOD: Duration = Duration::from_millis(500);
@@ -406,8 +417,12 @@ fn osc_type_name(t: &OscType) -> &'static str {
 /// reaching here. `link` is the AblLink session — passed in so
 /// `/link/set-tempo` can capture/mutate/commit the session state and
 /// have the change propagate to all Link peers.
-fn handle_osc_message(msg: &OscMessage, dispatch: &mut MidiDispatch, link: &AblLink) {
+fn handle_osc_message(msg: &OscMessage, dispatch: &mut MidiDispatch, link: &AblLink, restart: &mut bool) {
     match msg.addr.as_str() {
+        // A device's clocks or Euclids changed and restarted their own count
+        // (the FH-2 daemon, after a write that changed them): Start every
+        // clocked port again on the next bar line, which is the new origin.
+        "/clock/restart" => *restart = true,
         "/midi/note/at" => {
             if msg.args.len() != 6 {
                 eprintln!("/midi/note/at: expected 6 args, got {}", msg.args.len());
@@ -577,12 +592,12 @@ fn handle_osc_message(msg: &OscMessage, dispatch: &mut MidiDispatch, link: &AblL
     }
 }
 
-fn handle_osc_packet(packet: &OscPacket, dispatch: &mut MidiDispatch, link: &AblLink) {
+fn handle_osc_packet(packet: &OscPacket, dispatch: &mut MidiDispatch, link: &AblLink, restart: &mut bool) {
     match packet {
-        OscPacket::Message(msg) => handle_osc_message(msg, dispatch, link),
+        OscPacket::Message(msg) => handle_osc_message(msg, dispatch, link, restart),
         OscPacket::Bundle(bundle) => {
             for inner in &bundle.content {
-                handle_osc_packet(inner, dispatch, link);
+                handle_osc_packet(inner, dispatch, link, restart);
             }
         }
     }
@@ -648,6 +663,18 @@ fn main() {
         }
     };
 
+    // The clock origin rides beside the anchor, as its own message: the
+    // anchor's shape is fixed (Architeuthis matches `,hddd` exactly), and only
+    // es9-daemon counts divisions.
+    let send_origin = |beat: f64| -> std::io::Result<()> {
+        let msg = OscPacket::Message(OscMessage {
+            addr: "/clock/origin".into(),
+            args: vec![OscType::Double(beat)],
+        });
+        let packet = encoder::encode(&msg).expect("OSC encode failed");
+        osc_out.send_to(&packet, ORIGIN_TARGET).map(|_| ())
+    };
+
     // ─── Inbound OSC for MIDI dispatch (non-blocking) ─────────────────
     let midi_rx = UdpSocket::bind(MIDI_RX_ADDR).expect("bind MIDI dispatch socket");
     midi_rx
@@ -705,6 +732,10 @@ fn main() {
     let mut last_anchor_send = Instant::now() - ANCHOR_PERIOD;
     let mut last_midi_refresh = Instant::now();
     let mut last_logged_tempo: f64 = -1.0;
+    // The beat of the last Start: where the clocked devices count their
+    // divisions from, and so where es9-daemon counts its own (`/clock/origin`).
+    // Beat 0 until a device has been started.
+    let mut origin_beat: f64 = 0.0;
     let lookahead_micros = (LOOKAHEAD_MS * 1000.0) as i64;
 
     println!(
@@ -744,7 +775,16 @@ fn main() {
         loop {
             match midi_rx.recv_from(&mut rx_buf) {
                 Ok((n, _src)) => match decoder::decode_udp(&rx_buf[..n]) {
-                    Ok((_, packet)) => handle_osc_packet(&packet, &mut dispatch, &link),
+                    Ok((_, packet)) => {
+                        let mut restart = false;
+                        handle_osc_packet(&packet, &mut dispatch, &link, &mut restart);
+                        if restart {
+                            for c in clocks.iter_mut() {
+                                c.started = false;
+                            }
+                            println!("[clock] restart asked; Start on the next bar line");
+                        }
+                    }
                     Err(e) => eprintln!("midi-rx: OSC decode failed: {:?}", e),
                 },
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -834,6 +874,7 @@ fn main() {
                         if !c.started && tick.rem_euclid(ticks_per_bar) == 0 {
                             if dispatch.schedule_raw(&c.port, &[0xFA], unix_at - START_LEAD_MICROS) {
                                 c.started = true;
+                                origin_beat = (tick / CLOCK_PPQN as i64) as f64;
                                 println!("[clock] Start to '{}' on beat {}", c.port, tick / CLOCK_PPQN as i64);
                             }
                         }
@@ -858,6 +899,9 @@ fn main() {
             let tempo = state.tempo();
             if let Err(e) = send_anchor(unix_micros, beat_now, tempo) {
                 eprintln!("anchor send failed: {}", e);
+            }
+            if let Err(e) = send_origin(origin_beat) {
+                eprintln!("origin send failed: {}", e);
             }
             if (tempo - last_logged_tempo).abs() > 0.01 {
                 println!("[anchor] tempo {:.3} bpm  beat {:.3}", tempo, beat_now);
