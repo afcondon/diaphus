@@ -187,9 +187,8 @@ impl MidiDispatch {
     }
 
     /// Deliver any pending CoreMIDI notifications (returns at once if there are
-    /// none), then forget every cached destination. Must
-    /// run on the thread that created the client: `main`'s.
-    fn refresh(&mut self) {
+    /// none). Must run on the thread that created the client: `main`'s.
+    fn pump(&mut self) {
         // One call handles one pending source, and a device change arrives as
         // several notifications, so drain them (capped, so a storm cannot stall
         // the clock loop).
@@ -199,6 +198,16 @@ impl MidiDispatch {
                 break;
             }
         }
+    }
+
+    /// Pump, then forget every cached destination. Only the main loop's
+    /// periodic refresh does this, and it re-checks the clock ports at once.
+    /// A lookup that misses must not: clearing the cache there dropped the
+    /// clock ports' entries, so the next tick found no port, the clock stopped
+    /// until the next refresh, and restarted with a Start on a bar line (seen
+    /// 2026-10-19 as irregular FHX-8GT clocks whenever notes went elsewhere).
+    fn refresh(&mut self) {
+        self.pump();
         // Forget every lookup, every time. Counting destinations is not enough:
         // a device unplugged and replugged between two refreshes leaves the count
         // unchanged and the cached handle dead, and a send to a dead handle does
@@ -219,7 +228,7 @@ impl MidiDispatch {
         if let Some(d) = self.cache.get(name) {
             return Some(d.clone());
         }
-        self.refresh();
+        self.pump();
         let dest = Destinations
             .into_iter()
             .find(|d| d.display_name().as_deref() == Some(name))
