@@ -734,8 +734,14 @@ fn main() {
     let mut last_logged_tempo: f64 = -1.0;
     // The beat of the last Start: where the clocked devices count their
     // divisions from, and so where es9-daemon counts its own (`/clock/origin`).
-    // Beat 0 until a device has been started.
+    // Beat 0 until a device has been started. It is the origin of the *last*
+    // Start, one value for every clocked port: right with one port (the
+    // default, the FH-2); with several, es9-daemon follows whichever port
+    // was started most recently.
     let mut origin_beat: f64 = 0.0;
+    // Where the beat and tempo stood at the previous iteration, for telling a
+    // jump in the Link beat from time passing (see "1b").
+    let mut last_seen: Option<(i64, f64, f64)> = None; // (micros, beat, tempo)
     let lookahead_micros = (LOOKAHEAD_MS * 1000.0) as i64;
 
     println!(
@@ -794,6 +800,45 @@ fn main() {
                 }
             }
         }
+
+        // ─── 1b. A jump in the Link beat ──────────────────────────────
+        // The schedulers below only move forward and skip what is already
+        // past, so a beat that jumps (a peer joining realigns the phase, or
+        // forces a beat) would leave a gap of ticks never sent going
+        // forward, or no ticks until the timeline catches up going back.
+        // Either way the FH-2's count from its last Start would no longer
+        // match origin_beat, which es9-daemon counts from. So compare the
+        // beat Link reports with the beat that time alone would give since
+        // the last iteration. Elapsed time is measured, not assumed, so a
+        // late wake is not a jump; and a tempo change keeps the beat
+        // continuous at the moment of change, which lands the beat between
+        // the old tempo's estimate and the new one's, so neither is one.
+        let beat_now = state.beat_at_time(now_micros, QUANTUM);
+        let tempo_now = state.tempo();
+        if let Some((then_micros, then_beat, then_tempo)) = last_seen {
+            let secs = (now_micros - then_micros) as f64 / 1_000_000.0;
+            let at_old = then_beat + secs * then_tempo / 60.0;
+            let at_new = then_beat + secs * tempo_now / 60.0;
+            let (low, high) = (at_old.min(at_new), at_old.max(at_new));
+            let jumped_by = if beat_now > high {
+                beat_now - high
+            } else if beat_now < low {
+                beat_now - low
+            } else {
+                0.0
+            };
+            if jumped_by.abs() > 1.0 / CLOCK_PPQN {
+                // Start from here, and Start every port again on the next bar
+                // line, which re-sets origin_beat for both rigs at once.
+                last_scheduled_tick = (beat_now * CLOCK_PPQN).floor() as i64;
+                last_scheduled_beat = beat_now.floor() as i64;
+                for c in clocks.iter_mut() {
+                    c.started = false;
+                }
+                println!("[clock] the Link beat jumped by {:.2} beats; Start on the next bar line", jumped_by);
+            }
+        }
+        last_seen = Some((now_micros, beat_now, tempo_now));
 
         // ─── 2. CV/Gate scheduling for upcoming integer beats ─────────
         let beat_at_lookahead = state.beat_at_time(now_micros + lookahead_micros, QUANTUM);

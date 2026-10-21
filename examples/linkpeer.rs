@@ -1,5 +1,9 @@
 //! A Link peer for testing Diaphus against a session that misbehaves.
 //!
+//! WARNING: never run this during a performance. `jump`, `tempo` and `drag`
+//! change the beat or tempo of every Link peer on the network, a live
+//! Ableton set included, not just Diaphus.
+//!
 //!   linkpeer jump <beats> [secs]   join, move the session's beat by <beats>
 //!                                  (negative is backwards), stay [secs]
 //!   linkpeer tempo <bpm> [secs]    join, set the session tempo, stay [secs]
@@ -8,7 +12,7 @@
 //!   linkpeer join [secs]           join and stay [secs]: what a new app does
 //!
 //! `jump` uses Link's force_beat_at_time, which re-maps the beat for every
-//! peer: rude, and exactly the discontinuity a peer joining can cause.
+//! peer: exactly the discontinuity a peer joining can cause.
 use rusty_link::{AblLink, SessionState};
 use std::{thread, time::Duration};
 
