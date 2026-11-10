@@ -60,6 +60,14 @@
 //    es9-daemon counts its clocks and Euclids from the same beat, so the two
 //    rigs' divisions coincide. Added 2026-10-19.
 //
+// 8. The peer count. How many other Link peers share the session, sent to
+//    Architeuthis alone as `/link/peers ,i n`, its own message beside the
+//    anchor (whose shape is fixed: binnacle/conformance/LINK-ANCHOR.md), so a
+//    receiver that does not know it gives it the verdict "other" and counts
+//    nothing. Sent when it changes and once a second regardless, so a
+//    restarted Architeuthis has it within a second. Added 2026-11-10 for the
+//    Dashboard.
+//
 // Usage: diaphus [--debug-beat] [--test-midi] [bus] [duty]
 //   --debug-beat  enable per-beat /cv/trig/at + stdout log (off by default)
 //   --test-midi   enable per-beat MIDI note 62 → "Patterning 3"
@@ -109,6 +117,10 @@ const MIDI_RX_ADDR: &str = "127.0.0.1:57122";
 /// Where `/clock/origin` goes: es9-daemon's anchor port.
 const ORIGIN_TARGET: &str = "127.0.0.1:57123";
 const ANCHOR_PERIOD: Duration = Duration::from_millis(100);
+/// Where `/link/peers` goes: Architeuthis, which passes it to the Dashboard.
+const PEERS_TARGET: &str = "127.0.0.1:57121";
+/// How often the peer count is said again when it has not changed.
+const PEERS_PERIOD: Duration = Duration::from_secs(1);
 /// How often the main loop asks CoreMIDI whether devices came or went.
 const MIDI_REFRESH_PERIOD: Duration = Duration::from_millis(500);
 const GATE_VALUE: f32 = 0.5;
@@ -684,6 +696,15 @@ fn main() {
         osc_out.send_to(&packet, ORIGIN_TARGET).map(|_| ())
     };
 
+    let send_peers = |peers: u64| -> std::io::Result<()> {
+        let msg = OscPacket::Message(OscMessage {
+            addr: "/link/peers".into(),
+            args: vec![OscType::Int(peers.min(i32::MAX as u64) as i32)],
+        });
+        let packet = encoder::encode(&msg).expect("OSC encode failed");
+        osc_out.send_to(&packet, PEERS_TARGET).map(|_| ())
+    };
+
     // ─── Inbound OSC for MIDI dispatch (non-blocking) ─────────────────
     let midi_rx = UdpSocket::bind(MIDI_RX_ADDR).expect("bind MIDI dispatch socket");
     midi_rx
@@ -739,6 +760,7 @@ fn main() {
     let mut last_scheduled_tick: i64 = i64::MIN;
     let mut last_peers: u64 = u64::MAX;
     let mut last_anchor_send = Instant::now() - ANCHOR_PERIOD;
+    let mut last_peers_send = Instant::now() - PEERS_PERIOD;
     let mut last_midi_refresh = Instant::now();
     let mut last_logged_tempo: f64 = -1.0;
     // The beat of the last Start: where the clocked devices count their
@@ -778,9 +800,15 @@ fn main() {
         let now_micros = link.clock_micros();
 
         let peers = link.num_peers();
-        if peers != last_peers {
-            println!("[peers] {} peer(s) on session", peers);
+        if peers != last_peers || last_peers_send.elapsed() >= PEERS_PERIOD {
+            if peers != last_peers {
+                println!("[peers] {} peer(s) on session", peers);
+            }
+            if let Err(e) = send_peers(peers) {
+                eprintln!("peers send failed: {}", e);
+            }
             last_peers = peers;
+            last_peers_send = Instant::now();
         }
 
         // ─── 1. Drain inbound MIDI dispatch socket ────────────────────
