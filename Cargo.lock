@@ -137,6 +137,7 @@ version = "0.1.1"
 dependencies = [
  "core-foundation-sys",
  "coremidi",
+ "link-anchor",
  "mach2",
  "rosc",
  "rusty_link",
@@ -184,6 +185,10 @@ dependencies = [
  "cfg-if",
  "windows-link",
 ]
+
+[[package]]
+name = "link-anchor"
+version = "0.1.0"
 
 [[package]]
 name = "log"

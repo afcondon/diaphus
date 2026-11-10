@@ -6,6 +6,11 @@ edition = "2024"
 [dependencies]
 rusty_link = "0.4"
 rosc = "0.10"
+# /link/anchor: the value, its validity rule and its 56 bytes, shared with
+# es9-daemon and Itajara and held to Binnacle's conformance vectors. A path
+# while the three are developed side by side; see the note in its README
+# before publishing a build that must clone alone.
+link-anchor = { path = "../live-coding/binnacle/rust/link-anchor" }
 coremidi = "0.8"
 mach2 = "0.4"
 core-foundation-sys = "0.8"

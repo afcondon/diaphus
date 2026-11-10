@@ -66,6 +66,7 @@
 //   bus           OSC bus for the --debug-beat CV gate, default 8 (= ES-9 panel jack 1)
 //   duty          fraction of beat the CV gate is on, default 0.5
 
+use link_anchor::Anchor;
 use coremidi::{Client, Destination, Destinations, OutputPort, PacketBuffer};
 use core_foundation_sys::runloop::{kCFRunLoopDefaultMode, kCFRunLoopRunHandledSource, CFRunLoopRunInMode};
 use mach2::mach_time::{mach_absolute_time, mach_timebase_info, mach_timebase_info_data_t};
@@ -640,17 +641,25 @@ fn main() {
         osc_out.send_to(&packet, ES9_DAEMON_ADDR).map(|_| ())
     };
 
-    let send_anchor = |unix_micros: i64, beat: f64, tempo: f64| -> std::io::Result<()> {
-        let msg = OscPacket::Message(OscMessage {
-            addr: "/link/anchor".into(),
-            args: vec![
-                OscType::Long(unix_micros),
-                OscType::Double(beat),
-                OscType::Double(tempo),
-                OscType::Double(QUANTUM),
-            ],
-        });
-        let packet = encoder::encode(&msg).expect("OSC encode failed");
+    // The anchor's shape and validity rule are `link-anchor`'s, shared with
+    // every Rust receiver and held to Binnacle's conformance vectors
+    // (binnacle/conformance/LINK-ANCHOR.md). An anchor that fails the rule is
+    // not sent: receivers would refuse it, and saying so here names the cause.
+    let mut warned_unsendable = false;
+    let mut send_anchor = |unix_micros: i64, beat: f64, tempo: f64| -> std::io::Result<()> {
+        let packet = match Anchor::new(unix_micros, beat, tempo, QUANTUM) {
+            Ok(anchor) => anchor.encode(),
+            Err(refusal) => {
+                if !warned_unsendable {
+                    eprintln!(
+                        "anchor: not publishing time {} beat {} tempo {} quantum {} ({}); further ones dropped silently",
+                        unix_micros, beat, tempo, QUANTUM, refusal,
+                    );
+                    warned_unsendable = true;
+                }
+                return Ok(());
+            }
+        };
         let mut last_err: Option<std::io::Error> = None;
         for target in ANCHOR_TARGETS {
             if let Err(e) = osc_out.send_to(&packet, target) {
@@ -956,5 +965,38 @@ fn main() {
         }
 
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use link_anchor::Anchor;
+    use rosc::{OscMessage, OscPacket, OscType, encoder};
+
+    /// Until 2026-11-10 the anchor was built here with `rosc`. Publishing
+    /// through `link-anchor` must not have changed one byte of a valid
+    /// anchor, or every receiver that matched the old bytes would go deaf.
+    #[test]
+    fn the_shared_encoder_sends_what_rosc_sent() {
+        for (unix_micros, beat, tempo, quantum) in [
+            (1_794_326_400_000_000_i64, 128.5, 120.0, 4.0),
+            (0, -3.25, 20.0, 1.0),
+            (9_007_199_254_740_991, 1_234_567.875, 999.0, 64.0),
+        ] {
+            let before = encoder::encode(&OscPacket::Message(OscMessage {
+                addr: "/link/anchor".into(),
+                args: vec![
+                    OscType::Long(unix_micros),
+                    OscType::Double(beat),
+                    OscType::Double(tempo),
+                    OscType::Double(quantum),
+                ],
+            }))
+            .expect("rosc encodes it");
+            let after = Anchor::new(unix_micros, beat, tempo, quantum)
+                .expect("a valid anchor")
+                .encode();
+            assert_eq!(before, after.to_vec());
+        }
     }
 }
