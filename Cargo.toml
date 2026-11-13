@@ -11,7 +11,7 @@ rosc = "0.10"
 # (binnacle/conformance/LINK-ANCHOR.md). Taken from git at a pinned commit so
 # that this repository builds from a lone clone; Cargo finds the crate inside
 # the Binnacle repository by its package name.
-link-anchor = { git = "https://github.com/afcondon/binnacle", rev = "2eeec3cfac3d05e186aa265f36188afb97012f57" }
+link-anchor = { git = "https://github.com/afcondon/binnacle", rev = "000b9d91e5928b2d17969103662cc03c07db869b" }
 coremidi = "0.8"
 mach2 = "0.4"
 core-foundation-sys = "0.8"

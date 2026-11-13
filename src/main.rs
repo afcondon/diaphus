@@ -687,22 +687,21 @@ fn main() {
     // The clock origin rides beside the anchor, as its own message: the
     // anchor's shape is fixed (Architeuthis matches `,hddd` exactly), and only
     // es9-daemon counts divisions.
+    // Both packets are `link-anchor`'s, as the anchor's is: declared in
+    // binnacle/conformance/CLOCK-ORIGIN.md and LINK-PEERS.md and held to
+    // their vectors there. es9-daemon reads the origin with the same crate.
     let send_origin = |beat: f64| -> std::io::Result<()> {
-        let msg = OscPacket::Message(OscMessage {
-            addr: "/clock/origin".into(),
-            args: vec![OscType::Double(beat)],
-        });
-        let packet = encoder::encode(&msg).expect("OSC encode failed");
-        osc_out.send_to(&packet, ORIGIN_TARGET).map(|_| ())
+        match link_anchor::origin::encode(beat) {
+            Ok(packet) => osc_out.send_to(&packet, ORIGIN_TARGET).map(|_| ()),
+            Err(refusal) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("not sending a /clock/origin of {beat} ({refusal})"),
+            )),
+        }
     };
 
     let send_peers = |peers: u64| -> std::io::Result<()> {
-        let msg = OscPacket::Message(OscMessage {
-            addr: "/link/peers".into(),
-            args: vec![OscType::Int(peers.min(i32::MAX as u64) as i32)],
-        });
-        let packet = encoder::encode(&msg).expect("OSC encode failed");
-        osc_out.send_to(&packet, PEERS_TARGET).map(|_| ())
+        osc_out.send_to(&link_anchor::peers::encode(peers), PEERS_TARGET).map(|_| ())
     };
 
     // ─── Inbound OSC for MIDI dispatch (non-blocking) ─────────────────
