@@ -78,7 +78,7 @@ use link_anchor::Anchor;
 use coremidi::{Client, Destination, Destinations, OutputPort, PacketBuffer};
 use core_foundation_sys::runloop::{kCFRunLoopDefaultMode, kCFRunLoopRunHandledSource, CFRunLoopRunInMode};
 use mach2::mach_time::{mach_absolute_time, mach_timebase_info, mach_timebase_info_data_t};
-use rosc::{OscMessage, OscPacket, OscType, decoder, encoder};
+use rosc::{OscMessage, OscPacket, OscType, encoder};
 use rusty_link::{AblLink, SessionState};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -405,34 +405,13 @@ impl ClockOut {
     }
 }
 
-// Debug helper: descriptive single-line summary of an OscType variant.
-fn osc_type_name(t: &OscType) -> &'static str {
-    match t {
-        OscType::Int(_) => "Int",
-        OscType::Float(_) => "Float",
-        OscType::String(_) => "String",
-        OscType::Long(_) => "Long",
-        OscType::Double(_) => "Double",
-        OscType::Blob(_) => "Blob",
-        OscType::Time(_) => "Time",
-        OscType::Char(_) => "Char",
-        OscType::Color(_) => "Color",
-        OscType::Midi(_) => "Midi",
-        OscType::Bool(_) => "Bool",
-        OscType::Array(_) => "Array",
-        OscType::Nil => "Nil",
-        OscType::Inf => "Inf",
-    }
-}
-
 /// What an OSC message asks Diaphus to do: one variant per address of
 /// binnacle/conformance/DIAPHUS-INBOUND.md.
 ///
-/// Reading a message (`read_request`) is apart from carrying it out
-/// (`handle_osc_message`) so that the reading can be held to that
-/// declaration's vectors, which `inbound_tests` does. The values are as
-/// read: nothing here is range-checked or clamped, which is the behaviour
-/// the declaration records as looser than a writer may rely on.
+/// Reading a datagram (`read_packet`) is apart from carrying it out
+/// (`handle_request`) so that the reading can be held to that declaration's
+/// vectors, which `inbound_tests` does. A request has passed every declared
+/// rule: its values are in range.
 #[derive(Clone, Debug, PartialEq)]
 enum Request {
     NoteAt { port: String, channel: u8, note: u8, velocity: u8, duration_ms: u32, unix_us: i64 },
@@ -444,107 +423,131 @@ enum Request {
     ClockRestart,
 }
 
-/// Read one OSC message. `None` for an address Diaphus does not read
-/// (silently: OSC-spec compliant, and it keeps stdout clean if other
-/// senders share the port) and for one of its own addresses with the wrong
-/// arguments (said on stderr).
-fn read_request(msg: &OscMessage) -> Option<Request> {
-    let count = |want: usize| {
-        if msg.args.len() != want {
-            eprintln!("{}: expected {} args, got {}", msg.addr, want, msg.args.len());
-        }
-        msg.args.len() == want
+/// What one datagram on the inbound port is.
+#[derive(Clone, Debug, PartialEq)]
+enum Arrival {
+    /// One of Diaphus's messages, as declared.
+    Accept(Request),
+    /// Addressed to Diaphus and not as declared: the address, and the tag
+    /// of the rule it breaks. Counted, and not acted on.
+    Refuse(&'static str, &'static str),
+    /// Never one of Diaphus's messages. Ignored, and not counted.
+    Other,
+}
+
+/// Every message Diaphus reads: its address and its exact type tags. The
+/// declaration is binnacle/conformance/DIAPHUS-INBOUND.md, and
+/// `inbound_tests` holds this table to the vector file's own list.
+const INBOUND: [(&str, &str); 7] = [
+    ("/midi/note/at", "siiiih"),
+    ("/midi/on/at", "siiih"),
+    ("/midi/off/at", "siih"),
+    ("/midi/cc/at", "siiih"),
+    ("/link/set-tempo", "d"),
+    ("/link/play", "i"),
+    ("/clock/restart", ""),
+];
+
+/// Read one datagram, strictly: the declared type tags, a length that ends
+/// with the last argument, and every value inside its declared range. One
+/// bare message per datagram; a bundle is not one of ours.
+///
+/// The rules are applied in the order of the arguments, and the tag of the
+/// first one broken is the refusal's, as the reference gives it.
+fn read_packet(packet: &[u8]) -> Arrival {
+    use link_anchor::strict::{read_any, Argument, Read};
+
+    let (address, arguments) = match read_any(packet, &INBOUND) {
+        (_, Read::Other) => return Arrival::Other,
+        (address, Read::Refuse(tag)) => return Arrival::Refuse(address, tag),
+        (address, Read::Accept(arguments)) => (address, arguments),
     };
-    let string = |i: usize| match &msg.args[i] {
-        OscType::String(s) => Some(s.clone()),
-        t => { eprintln!("{}[{}] String expected, got {}", msg.addr, i, osc_type_name(t)); None }
+    let text = |i: usize| match &arguments[i] {
+        Argument::Text(text) => text.clone(),
+        other => unreachable!("the tags said a string, and it is {other:?}"),
     };
-    let int = |i: usize| match &msg.args[i] {
-        OscType::Int(v) => Some(*v),
-        t => { eprintln!("{}[{}] Int expected, got {}", msg.addr, i, osc_type_name(t)); None }
+    let whole = |i: usize| match &arguments[i] {
+        Argument::Int(value) => *value,
+        other => unreachable!("the tags said an int32, and it is {other:?}"),
     };
-    let long = |i: usize| match &msg.args[i] {
-        OscType::Long(v) => Some(*v),
-        t => { eprintln!("{}[{}] Long expected, got {}", msg.addr, i, osc_type_name(t)); None }
+    let channel = |i: usize| u8::try_from(whole(i)).ok().filter(|c| (1..=16).contains(c)).ok_or("channel-out-of-range");
+    let seven_bit = |i: usize| u8::try_from(whole(i)).ok().filter(|v| *v <= 127).ok_or("not-seven-bit");
+    let moment = |i: usize| match &arguments[i] {
+        Argument::Long(micros) if *micros >= 0 => Ok(*micros),
+        Argument::Long(_) => Err("time-before-epoch"),
+        other => unreachable!("the tags said an int64, and it is {other:?}"),
     };
-    match msg.addr.as_str() {
-        // A device's clocks or Euclids changed and restarted their own count
-        // (the FH-2 daemon, after a write that changed them): Start every
-        // clocked port again on the next bar line, which is the new origin.
-        "/clock/restart" => Some(Request::ClockRestart),
-        "/midi/note/at" => {
-            if !count(6) { return None; }
-            Some(Request::NoteAt {
-                port: string(0)?,
-                channel: int(1)? as u8,
-                note: int(2)? as u8,
-                velocity: int(3)? as u8,
-                duration_ms: int(4)? as u32,
-                unix_us: long(5)?,
-            })
-        }
-        // /midi/on/at  port channel note velocity unix_us: a note-on alone
-        "/midi/on/at" => {
-            if !count(5) { return None; }
-            Some(Request::NoteOnAt {
-                port: string(0)?,
-                channel: int(1)? as u8,
-                note: int(2)? as u8,
-                velocity: int(3)? as u8,
-                unix_us: long(4)?,
-            })
-        }
-        // /midi/off/at port channel note unix_us: its note-off
-        "/midi/off/at" => {
-            if !count(4) { return None; }
-            Some(Request::NoteOffAt {
-                port: string(0)?,
-                channel: int(1)? as u8,
-                note: int(2)? as u8,
-                unix_us: long(3)?,
-            })
-        }
-        "/midi/cc/at" => {
-            if !count(5) { return None; }
-            Some(Request::ControlAt {
-                port: string(0)?,
-                channel: int(1)? as u8,
-                controller: int(2)? as u8,
-                value: int(3)? as u8,
-                unix_us: long(4)?,
-            })
-        }
-        // Either Float or Double is read, to be tolerant of sender-side
-        // encoding differences: Architeuthis sends a Float, Itajara the
-        // declared Double.
-        "/link/set-tempo" => {
-            if !count(1) { return None; }
-            match &msg.args[0] {
-                OscType::Float(f) => Some(Request::SetTempo { bpm: *f as f64 }),
-                OscType::Double(d) => Some(Request::SetTempo { bpm: *d }),
-                t => { eprintln!("/link/set-tempo[0] Float/Double expected, got {}", osc_type_name(t)); None }
-            }
-        }
-        "/link/play" => {
-            if !count(1) { return None; }
-            match &msg.args[0] {
-                OscType::Int(i) => Some(Request::Play { on: *i != 0 }),
-                OscType::Float(f) => Some(Request::Play { on: *f != 0.0 }),
-                OscType::Bool(b) => Some(Request::Play { on: *b }),
-                t => { eprintln!("/link/play[0] Int/Float/Bool expected, got {}", osc_type_name(t)); None }
-            }
-        }
-        _ => None,
+
+    let request = (|| -> Result<Request, &'static str> {
+        Ok(match address {
+            "/midi/note/at" => Request::NoteAt {
+                port: text(0),
+                channel: channel(1)?,
+                note: seven_bit(2)?,
+                velocity: seven_bit(3)?,
+                duration_ms: u32::try_from(whole(4)).map_err(|_| "negative-duration")?,
+                unix_us: moment(5)?,
+            },
+            "/midi/on/at" => Request::NoteOnAt {
+                port: text(0), channel: channel(1)?, note: seven_bit(2)?, velocity: seven_bit(3)?, unix_us: moment(4)?,
+            },
+            "/midi/off/at" => Request::NoteOffAt { port: text(0), channel: channel(1)?, note: seven_bit(2)?, unix_us: moment(3)? },
+            "/midi/cc/at" => Request::ControlAt {
+                port: text(0), channel: channel(1)?, controller: seven_bit(2)?, value: seven_bit(3)?, unix_us: moment(4)?,
+            },
+            "/link/set-tempo" => match &arguments[0] {
+                Argument::Double(bpm) if !bpm.is_finite() => return Err("non-finite-value"),
+                Argument::Double(bpm) if !(20.0..=999.0).contains(bpm) => return Err("tempo-out-of-range"),
+                Argument::Double(bpm) => Request::SetTempo { bpm: *bpm },
+                other => unreachable!("the tags said a binary64, and it is {other:?}"),
+            },
+            "/link/play" => match whole(0) {
+                0 => Request::Play { on: false },
+                1 => Request::Play { on: true },
+                _ => return Err("not-a-flag"),
+            },
+            // A device's clocks or Euclids changed and restarted their own
+            // count (the FH-2 daemon, after a write that changed them):
+            // Start every clocked port again on the next bar line, which is
+            // the new origin.
+            "/clock/restart" => Request::ClockRestart,
+            other => unreachable!("an address that is not in INBOUND: {other}"),
+        })
+    })();
+    match request {
+        Ok(request) => Arrival::Accept(request),
+        Err(tag) => Arrival::Refuse(address, tag),
     }
 }
 
-/// Carry out a single OSC message: a MidiDispatch call, or a change to the
-/// Link session. Bundles are flattened by the caller before reaching here.
+/// The datagrams that were addressed to Diaphus and refused. All are
+/// counted; the first of each kind is said on stderr, so the log names the
+/// cause without a line per packet.
+#[derive(Default)]
+struct Refusals {
+    count: u64,
+    said: Vec<(&'static str, &'static str)>,
+}
+
+impl Refusals {
+    fn count(&mut self, address: &'static str, tag: &'static str) {
+        self.count += 1;
+        if !self.said.contains(&(address, tag)) {
+            self.said.push((address, tag));
+            eprintln!(
+                "midi-rx: refusing a {address} that breaks its declared rule ({tag}); {} refused so far, further ones of this kind are counted, not said",
+                self.count
+            );
+        }
+    }
+}
+
+/// Carry out one request: a MidiDispatch call, or a change to the Link
+/// session.
 /// `link` is the AblLink session, passed in so `/link/set-tempo` can
 /// capture/mutate/commit the session state and have the change propagate
 /// to all Link peers.
-fn handle_osc_message(msg: &OscMessage, dispatch: &mut MidiDispatch, link: &AblLink, restart: &mut bool) {
-    let Some(request) = read_request(msg) else { return };
+fn handle_request(request: Request, dispatch: &mut MidiDispatch, link: &AblLink, restart: &mut bool) {
     match request {
         Request::ClockRestart => *restart = true,
         Request::NoteAt { port, channel, note, velocity, duration_ms, unix_us } => {
@@ -619,17 +622,6 @@ fn handle_osc_message(msg: &OscMessage, dispatch: &mut MidiDispatch, link: &AblL
                 at,
                 (at - now) as f64 / 1000.0
             );
-        }
-    }
-}
-
-fn handle_osc_packet(packet: &OscPacket, dispatch: &mut MidiDispatch, link: &AblLink, restart: &mut bool) {
-    match packet {
-        OscPacket::Message(msg) => handle_osc_message(msg, dispatch, link, restart),
-        OscPacket::Bundle(bundle) => {
-            for inner in &bundle.content {
-                handle_osc_packet(inner, dispatch, link, restart);
-            }
         }
     }
 }
@@ -803,6 +795,7 @@ fn main() {
     // any reasonable OSC packet — the typical /midi/note/at message is
     // <80 bytes including padding.
     let mut rx_buf = [0u8; 4096];
+    let mut refusals = Refusals::default();
 
     loop {
         // Hear about MIDI devices plugged in or out (see `MidiDispatch::refresh`).
@@ -834,10 +827,10 @@ fn main() {
         // tick on dense patterns / CC streams).
         loop {
             match midi_rx.recv_from(&mut rx_buf) {
-                Ok((n, _src)) => match decoder::decode_udp(&rx_buf[..n]) {
-                    Ok((_, packet)) => {
+                Ok((n, _src)) => match read_packet(&rx_buf[..n]) {
+                    Arrival::Accept(request) => {
                         let mut restart = false;
-                        handle_osc_packet(&packet, &mut dispatch, &link, &mut restart);
+                        handle_request(request, &mut dispatch, &link, &mut restart);
                         if restart {
                             for c in clocks.iter_mut() {
                                 c.started = false;
@@ -845,7 +838,8 @@ fn main() {
                             println!("[clock] restart asked; Start on the next bar line");
                         }
                     }
-                    Err(e) => eprintln!("midi-rx: OSC decode failed: {:?}", e),
+                    Arrival::Refuse(address, tag) => refusals.count(address, tag),
+                    Arrival::Other => {}
                 },
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) => {
@@ -1049,16 +1043,13 @@ mod anchor_tests {
 #[cfg(test)]
 mod inbound_tests {
     //! Replays binnacle/conformance/vectors/diaphus-inbound.json against
-    //! `read_request`: every packet a writer may send, and every packet
-    //! that is not as declared but is sent on the rig today, must be read
-    //! as the request the vector file says.
+    //! `read_packet`, all four parts: every packet a writer may send must be
+    //! read as the request the file says; every refused packet must be
+    //! refused, with the file's reason; every other packet must be other.
     //!
-    //! Sections skipped, by name: `refused` and `other`. Diaphus reads more
-    //! loosely than the declaration (it checks no range), so it is not yet
-    //! held to refusals. See DIAPHUS-INBOUND.md.
+    //! No section is skipped. See DIAPHUS-INBOUND.md.
 
-    use super::{read_request, Request};
-    use rosc::{decoder, OscPacket};
+    use super::{read_packet, Arrival, Request, INBOUND};
     use serde_json::Value;
 
     fn vectors() -> Value {
@@ -1092,44 +1083,65 @@ mod inbound_tests {
         }
     }
 
-    fn replay(section: &str) -> usize {
+    fn section(name: &str) -> Vec<Value> {
         let json = vectors();
-        let cases = json[section].as_array().unwrap_or_else(|| panic!("no {section} section"));
-        let mut failures = Vec::new();
-        for case in cases {
-            let name = case["name"].as_str().expect("name");
-            let want = declared(case["address"].as_str().expect("address"), case["values"].as_array().expect("values"));
-            let got = match decoder::decode_udp(&bytes(case["hex"].as_str().expect("hex"))) {
-                Ok((_, OscPacket::Message(message))) => read_request(&message),
-                _ => None,
-            };
-            if got.as_ref() != Some(&want) {
-                failures.push(format!("{section}/{name}: read as {got:?}, the vector file says {want:?}"));
-            }
-        }
+        json[name].as_array().unwrap_or_else(|| panic!("no {name} section")).clone()
+    }
+
+    fn check(failures: Vec<String>) {
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
-        cases.len()
     }
 
     #[test]
     fn every_declared_packet_is_read_as_declared() {
-        assert!(replay("packets") > 0, "no packets: nothing was tested");
+        let cases = section("packets");
+        assert!(!cases.is_empty(), "no packets: nothing was tested");
+        check(cases.iter().filter_map(|case| {
+            let name = case["name"].as_str().expect("name");
+            let want = declared(case["address"].as_str().expect("address"), case["values"].as_array().expect("values"));
+            let got = read_packet(&bytes(case["hex"].as_str().expect("hex")));
+            (got != Arrival::Accept(want.clone())).then(|| format!("packets/{name}: read as {got:?}, the vector file says {want:?}"))
+        }).collect());
     }
 
     #[test]
-    fn what_the_rig_sends_today_is_still_read() {
-        replay("tolerated");
+    fn every_refused_packet_is_refused_for_the_declared_reason() {
+        let cases = section("refused");
+        assert!(!cases.is_empty(), "no refused packets: nothing was tested");
+        check(cases.iter().filter_map(|case| {
+            let name = case["name"].as_str().expect("name");
+            let reason = case["reason"].as_str().expect("reason");
+            match read_packet(&bytes(case["hex"].as_str().expect("hex"))) {
+                // A case made mechanically carries no reason: any refusal.
+                Arrival::Refuse(_, tag) if reason.is_empty() || tag == reason => None,
+                got => Some(format!("refused/{name}: read as {got:?}, the vector file says refuse ({reason})")),
+            }
+        }).collect());
     }
 
     #[test]
-    fn every_declared_address_is_known_here() {
-        let json = vectors();
-        for message in json["messages"].as_array().expect("messages") {
-            let address = message["address"].as_str().expect("address");
-            assert!(
-                ["/midi/note/at", "/midi/on/at", "/midi/off/at", "/midi/cc/at", "/link/set-tempo", "/link/play", "/clock/restart"].contains(&address),
-                "the declaration has an address Diaphus does not read: {address}"
-            );
-        }
+    fn what_is_not_ours_is_other() {
+        let cases = section("other");
+        assert!(!cases.is_empty(), "no other packets: nothing was tested");
+        check(cases.iter().filter_map(|case| {
+            let name = case["name"].as_str().expect("name");
+            let got = read_packet(&bytes(case["hex"].as_str().expect("hex")));
+            (got != Arrival::Other).then(|| format!("other/{name}: read as {got:?}, the vector file says other"))
+        }).collect());
+    }
+
+    /// Nothing is tolerated any more: what was is now in `refused`.
+    #[test]
+    fn nothing_is_tolerated() {
+        assert!(section("tolerated").is_empty(), "the vector file tolerates something this reader refuses");
+    }
+
+    #[test]
+    fn the_table_of_messages_is_the_declared_one() {
+        let declared: Vec<(String, String)> = vectors()["messages"].as_array().expect("messages").iter()
+            .map(|message| (message["address"].as_str().expect("address").to_string(), message["tags"].as_str().expect("tags").to_string()))
+            .collect();
+        let here: Vec<(String, String)> = INBOUND.iter().map(|(address, tags)| (address.to_string(), tags.to_string())).collect();
+        assert_eq!(here, declared);
     }
 }

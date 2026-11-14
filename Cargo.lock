@@ -196,7 +196,7 @@ dependencies = [
 [[package]]
 name = "link-anchor"
 version = "0.1.0"
-source = "git+https://github.com/afcondon/binnacle?rev=5e62b162a266a8689ba177f860e908f8e03b7e62#5e62b162a266a8689ba177f860e908f8e03b7e62"
+source = "git+https://github.com/afcondon/binnacle?rev=ac0481ed6745e1813c5e402d5b75fbd1e588ede1#ac0481ed6745e1813c5e402d5b75fbd1e588ede1"
 
 [[package]]
 name = "log"
